@@ -1,0 +1,271 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 JASPAR
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+########################
+# How to use
+# - Please use this file with "/japanese-check/examples/japanese-check.yml"
+# - README for this action is here: "japanese-check/README.md"
+########################
+name: Check Japanese in code
+description: 'Verify that PR commits do not contain Japanese characters'
+author: 'Yoriito'
+
+inputs:
+  token:
+    description: 'GitHub Token'
+    required: false
+  pattern:
+    description: 'Pattern for detection; Japanese, full-width alphanumerics, symbols, etc.'
+    required: false
+    default: '[ぁ-んァ-ン一-龥Ａ-Ｚａ-ｚ０-９！-～、。「」『』【】（）＜＞［］｛｝：；？＠￥％＆＋＊＝ー―＿]'
+  exclude_patterns:
+    description: 'Regex pattern(s) (| separated) for files to exclude. Example: README\.md|docs/|test/'
+    required: false
+    default: ''    
+  skip_list_ext:
+    description: 'File extensions to exclude, separated by "|" (pipe).'
+    required: false
+    default: 'doc|docx|xls|xlsx|ppt|pptx|zip|pdf|png|jpg|jpeg|gif|exe|elf|dll|so|o|a|jar|war|tar|gz|tgz|bz2|xz|7z|mp3|mp4|mov|avi|flv|webm|ico|woff|woff2|ttf|eot|bmp|psd|apk|bin|dat|dmg|pack|svg|drawio|dio'
+  skip_list_mime:
+    description: 'Prefixes of MIME types to exclude, separated by "|".'
+    required: false
+    default: 'application/|image/|audio/|video/'
+  checklist_mime:
+    description: 'Exception MIME types to check again, separated by "|" (patterns allowed).'
+    required: false
+    default: 'image/.*xml|application/.*xml|application/.*json|application/.*yaml|application/.*jwt|application/x-.*|application/javascript|application/rtf|application/ecmascript|application/sql'
+  log_level:
+    description: >
+      Log verbosity for console output.  
+      - "error": Show only files/commits with errors or that were skipped.  
+      - "modified": Additionally list all files/commits checked on PUSH/PR events.  
+      - "all": List all files/commits checked regardless of event type.
+    required: false
+    default: 'modified'
+
+
+outputs:
+  is_valid_files:
+    description: 'Whether all files are valid'
+    value: ${{ steps.check_files.outputs.is_valid_files || 'true' }}
+  is_valid_commits:
+    description: 'Whether all commits are valid'
+    value: ${{steps.check_commits.outputs.is_valid_commits || 'true' }}
+  invalid_file_count:
+    description: 'Number of invalid files'
+    value: ${{ steps.check_files.outputs.invalid_file_count || 0 }}
+  invalid_commit_count:
+    description: 'Number of invalid commits'
+    value: ${{ steps.check_commits.outputs.invalid_commit_count || 0 }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set base reference for diff
+      id: set_base_ref
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        echo "is_new_branch=false" >> $GITHUB_OUTPUT
+        BASE_COMMIT_FOUND=1
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BR="origin/${{ github.event.pull_request.base.ref }}"
+          git diff --name-only -z "$BR..HEAD" > .target_files
+          git log --no-merges "$BR..HEAD" --format='%H%n%B%n==END==' > .target_commits
+        elif [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "is_new_branch=true" >> $GITHUB_OUTPUT
+            echo "Japanese check is skipped since this is a new branch."
+            BR=""
+            > .target_commits
+          else
+            BR="${{ github.event.before }}"
+            if git cat-file -e "$BR^{commit}" 2>/dev/null; then
+              git diff --name-only -z "$BR" > .target_files
+              git log --no-merges "$BR..HEAD" --format='%H%n%B%n==END==' > .target_commits
+            else
+              BASE_COMMIT_FOUND=0
+              echo "No valid base commit found. Checking all files."
+              find . -type f ! -path "*/.git/*" ! -name ".target_files" -print0 > .target_files
+              git log --format='%H%n%B%n==END==' > .target_commits
+            fi
+          fi
+        else # github.event_name is "workflow_dispatch"
+          BR="${{ github.event.before }}"
+          find . -type f ! -path "*/.git/*" ! -name ".target_files" -print0 > .target_files
+          git log --format='%H%n%B%n==END==' > .target_commits
+        fi
+
+        echo "BASE_REF=$BR" >> $GITHUB_ENV
+        [ -s .target_files ] && echo "has_files=true" >> $GITHUB_OUTPUT || echo "has_files=false" >> $GITHUB_OUTPUT
+        [ -s .target_commits ] && echo "has_commits=true" >> $GITHUB_OUTPUT || echo "has_commits=false" >> $GITHUB_OUTPUT
+        echo "BASE_COMMIT_FOUND=$BASE_COMMIT_FOUND" >> $GITHUB_ENV
+
+
+    - name: Check for Japanese characters in modified text files
+      id: check_files
+      shell: bash
+      if: steps.set_base_ref.outputs.is_new_branch == 'false' && steps.set_base_ref.outputs.has_files == 'true'
+      env:
+        LANG: en_US.UTF-8
+        GITHUB_TOKEN: ${{ inputs.token }}
+        BASE_COMMIT_FOUND: ${{ env.BASE_COMMIT_FOUND }}
+        BASE_REF: ${{ env.BASE_REF }}
+      run: |
+        # Output BASE_REF info depending on log_level and event
+        if [ "${{github.event_name}}" != "workflow_dispatch" ]; then
+          # For PR/PUSH events and log_level not "error"
+          echo "--- Checking Modified Files ---"
+          echo "BASE_REF: ${BASE_REF}"
+        else
+          # For workflow_dispatch and log_level "all"
+          echo "--- Checking All Files in this Repository ---"
+        fi
+
+        # Japanese check Conditions
+        pattern='${{ inputs.pattern }}'
+        exclude_patterns='${{ inputs.exclude_patterns }}'
+        has_japanese=0
+
+        # skip_list to exclude certain file extensions and mime-types
+        skip_list_ext='${{ inputs.skip_list_ext }}'
+        skip_list_mime='${{ inputs.skip_list_mime }}'
+        checklist_mime='${{ inputs.checklist_mime }}'
+
+        while IFS= read -r -d '' file; do
+          # Skip files that do not exist in the working directory (e.g., deleted in diff)
+          if [[ ! -f "$file" ]]; then
+            echo "  Skipped (file does not exist): $file"
+            continue
+          fi
+          mime=$(file --mime-type -b "$file")
+
+          if   [ "${{ inputs.log_level }}" = "all" ] || ( [ "${{ inputs.log_level }}" = "modified" ] && [ "$BASE_COMMIT_FOUND" -eq 1 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ] ); then
+            echo "Checking: $file ($mime)"
+          fi
+
+          # Exclude japanese-check workflow files themselves
+          if [[ "$file" == *japanese-check* ]]; then
+            echo "  Skipped (Japanese-check workflow file): $file"
+            continue
+          fi
+
+          # Exclude specified files that user defined
+          if [[ -n "$exclude_patterns" && "$file" =~ ($exclude_patterns) ]]; then
+            echo "  Skipped (exclude_patterns): $file"
+            continue
+          fi
+
+          # Exclude files with skip_list extensions
+          if [[ "$file" =~ \.($skip_list_ext)$ ]]; then
+            echo "  Skipped (skip_list_ext): $file"
+            continue
+          fi
+
+          # Exclude files with skip_list_mime types, except those included in checklist_mime
+          if [[ "$mime" =~ ^($skip_list_mime) ]]; then
+            if ! [[ "$mime" =~ $checklist_mime ]]; then
+              echo "  Skipped (skip_list_mime): $file ($mime)"
+              continue
+            else
+              echo "  Checking: $file ($mime) -- Exception of skip_list_mime (included in checklist_mime)"
+            fi
+          fi
+
+          # Check remaining all files
+          if grep -q -P "$pattern" "$file"; then
+            # Error flag
+            has_japanese=$((has_japanese + 1))
+            # Error message with line numbers and file names
+            echo "  Error-$has_japanese: $file ($mime)"
+            grep -nH -P --color=always "$pattern" "$file" | sed 's/^/    /'
+          fi
+        done < .target_files
+
+        # Summarize Japanese check results for files
+        if [ "$has_japanese" -gt 0 ]; then
+          echo "Error: Japanese text found in the files above! (total $has_japanese files)"
+          echo "is_valid_files=false"  >> $GITHUB_OUTPUT
+        else
+          echo "is_valid_files=true" >> $GITHUB_OUTPUT 
+        fi
+        echo "invalid_file_count=$has_japanese" >> $GITHUB_OUTPUT
+      
+
+    - name: Check Japanese in Commit Messages
+      id: check_commits
+      shell: bash
+      if: steps.set_base_ref.outputs.is_new_branch == 'false' && steps.set_base_ref.outputs.has_commits == 'true'
+      env:
+        LANG: en_US.UTF-8
+        GITHUB_TOKEN: ${{ inputs.token }}
+        BASE_COMMIT_FOUND: ${{ env.BASE_COMMIT_FOUND }}
+      run: |
+        echo "--- Checking Commit Messages ---"
+        # Set Japanese check Conditions and initialize variables. 
+        pattern='${{ inputs.pattern }}'
+        has_jp_commit=0
+        current_hash=""
+        current_msg=""
+
+        while IFS= read -r line; do
+          #########
+          # Use a single git log invocation to fetch all commit hashes and messages.
+          # Format per commit:
+          #   <hash>
+          #   <message body...>
+          #   ==END==
+          #########
+          if [ -z "$current_hash" ]; then
+            # First line of a commit block: the hash
+            current_hash="$line"
+            : > .commitmsg_buf
+
+            # Logging according to log_level and event_name
+            if [ "${{ inputs.log_level }}" = "all" ] || ( [ "${{ inputs.log_level }}" = "modified" ] && [ "$BASE_COMMIT_FOUND" -eq 1 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ] ); then
+              echo "Checking: ${current_hash:0:7} (Full commit hash: $current_hash)"
+            fi
+
+          elif [ "$line" = "==END==" ]; then
+            # End of this commit's message; check for Japanese characters
+            current_msg=$(cat .commitmsg_buf)
+            if printf '%s\n' "$current_msg" | grep -q -P "$pattern"; then
+              has_jp_commit=$((has_jp_commit + 1))
+              echo "  Error: Japanese found in commit (${current_hash:0:7})"
+              printf '%s\n' "$current_msg" | sed 's/^/    /'
+            fi
+            # Reset for the next commit
+            current_hash=""
+            rm -f .commitmsg_buf
+
+          else
+            # Accumulate commit message lines
+            printf '%s\n' "$line" >> .commitmsg_buf
+          fi
+        done < .target_commits
+        rm -f .commitmsg_buf
+        
+        # Summarize Japanese check results for commits
+        if [ "$has_jp_commit" -gt 0 ]; then
+          echo "Error: Total $has_jp_commit commits contain Japanese."
+          echo "is_valid_commits=false"  >> $GITHUB_OUTPUT
+        else
+          echo "is_valid_commits=true"  >> $GITHUB_OUTPUT
+        fi
+        echo "invalid_commit_count=$has_jp_commit" >> $GITHUB_OUTPUT
+
+

@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 JASPAR
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'Check Conventional Commits'
+description: 'Verify that PR commits follow Conventional Commits specification'
+author: 'Yoriito'
+
+inputs:
+  token:
+    description: 'GitHub Token'
+    required: true
+  types:
+    description: 'Allowed commit types (comma-separated)'
+    required: false
+    default: 'feat,fix,docs,style,refactor,perf,test,chore,ci,build'
+  require-scope:
+    description: 'Require scope in commit message'
+    required: false
+    default: 'false'
+  ignore-merge-commits:
+    description: 'Ignore merge commits'
+    required: false
+    default: 'true'
+
+outputs:
+  valid:
+    description: 'Whether all commits are valid'
+    value: ${{ steps.check.outputs.valid }}
+  invalid-count:
+    description: 'Number of invalid commits'
+    value: ${{ steps.check.outputs.invalid-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check Conventional Commits
+      id: check
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        ALLOWED_TYPES: ${{ inputs.types }}
+        REQUIRE_SCOPE: ${{ inputs.require-scope }}
+        IGNORE_MERGE: ${{ inputs.ignore-merge-commits }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+
+        # Build regex pattern for allowed types
+        TYPES_PATTERN=$(echo "$ALLOWED_TYPES" | tr ',' '|')
+
+        if [ "$REQUIRE_SCOPE" = "true" ]; then
+          # Scope is required: type(scope): or type(scope)!:
+          COMMIT_REGEX="^($TYPES_PATTERN)\([^)]+\)!?: .+"
+        else
+          # Scope is optional: type: or type(scope): or type!: or type(scope)!:
+          COMMIT_REGEX="^($TYPES_PATTERN)(\([^)]+\))?!?: .+"
+        fi
+
+        echo "Commit pattern: $COMMIT_REGEX"
+        echo "Allowed types: $ALLOWED_TYPES"
+        echo ""
+
+        # Get PR commits
+        COMMITS=$(gh pr view "$PR_NUMBER" --json commits --jq '.commits[] | "\(.oid)|\(.messageHeadline)"')
+
+        if [ -z "$COMMITS" ]; then
+          echo "No commits found in PR"
+          echo "valid=true" >> $GITHUB_OUTPUT
+          echo "invalid-count=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        INVALID_COMMITS=""
+        INVALID_COUNT=0
+        TOTAL_COUNT=0
+
+        while IFS='|' read -r sha message; do
+          [ -z "$sha" ] && continue
+
+          TOTAL_COUNT=$((TOTAL_COUNT + 1))
+          SHORT_SHA="${sha:0:7}"
+
+          # Skip merge commits if configured
+          if [ "$IGNORE_MERGE" = "true" ] && echo "$message" | grep -qE "^Merge (pull request|branch)"; then
+            echo "⏭️  $SHORT_SHA: Merge commit (skipped)"
+            continue
+          fi
+
+          # Check against regex
+          if echo "$message" | grep -qE "$COMMIT_REGEX"; then
+            echo "✅ $SHORT_SHA: $message"
+          else
+            echo "❌ $SHORT_SHA: $message"
+            INVALID_COMMITS="${INVALID_COMMITS}| ${SHORT_SHA} | \`${message}\` |\n"
+            INVALID_COUNT=$((INVALID_COUNT + 1))
+          fi
+        done <<< "$COMMITS"
+
+        echo ""
+        echo "================================"
+        echo "Total: $TOTAL_COUNT, Invalid: $INVALID_COUNT"
+        echo "================================"
+
+        # Output results
+        echo "invalid-count=$INVALID_COUNT" >> $GITHUB_OUTPUT
+
+        if [ "$INVALID_COUNT" -gt 0 ]; then
+          echo "valid=false" >> $GITHUB_OUTPUT
+
+          # Build comment body
+          COMMENT_BODY="## ❌ Conventional Commits Check Failed
+
+        The following commits do not follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
+
+        | Commit | Message |
+        |--------|---------|
+        $(echo -e "$INVALID_COMMITS")
+
+        ### Expected Format
+
+        \`\`\`
+        <type>(<scope>): <description>
+        \`\`\`
+
+        **Allowed types:** \`${ALLOWED_TYPES//,/\`, \`}\`
+
+        ### Examples
+
+        - \`feat: add new feature\`
+        - \`fix(api): resolve null pointer exception\`
+        - \`docs: update README\`
+        - \`feat!: breaking change in API\`
+
+        ### How to Fix
+
+        You can amend your commit messages using:
+
+        \`\`\`bash
+        # For the last commit
+        git commit --amend -sm \"feat: your new message\"
+
+        # For older commits (interactive rebase)
+        git rebase -i HEAD~N  # N = number of commits to edit
+        # Change 'pick' to 'reword' for commits you want to rename
+        \`\`\`
+
+        After fixing, force push to update the PR:
+
+        \`\`\`bash
+        git push --force-with-lease
+        \`\`\`
+        "
+
+          # Post comment to PR
+          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+
+          echo ""
+          echo "❌ Check failed. Comment posted to PR."
+          exit 1
+        else
+          echo "valid=true" >> $GITHUB_OUTPUT
+          echo ""
+          echo "✅ All commits follow Conventional Commits specification."
+        fi

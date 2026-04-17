@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 JASPAR
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# .github/workflows/release.yml
+# Advanced release workflow using prepare + finalize phases
+#
+# Flow:
+#   [prepare] Analyze commits -> Generate CHANGELOG -> Commit CHANGELOG
+#       ↓
+#   [custom]  Your processing (version file updates, etc.)
+#       ↓
+#   [finalize] Create tag -> Push all commits -> GitHub Release
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Create as pre-release'
+        type: boolean
+        default: false
+      prerelease-suffix:
+        description: 'Pre-release suffix (if pre-release)'
+        type: choice
+        default: 'alpha'
+        options:
+          - alpha
+          - beta
+          - rc
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    outputs:
+      release-created: ${{ steps.finalize.outputs.release-created }}
+      version: ${{ steps.prepare.outputs.version }}
+      version-core: ${{ steps.prepare.outputs.version-core }}
+      tag-name: ${{ steps.prepare.outputs.tag-name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # ================================================================
+      # Phase 1: PREPARE
+      # - Analyze commits and determine version
+      # - Generate CHANGELOG
+      # - Commit CHANGELOG (not pushed yet)
+      # ================================================================
+      - name: Prepare Release
+        id: prepare
+        uses: yoriito/actions/semantic-release@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          phase: prepare
+          prerelease: ${{ inputs.prerelease || false }}
+          prerelease-suffix: ${{ inputs.prerelease-suffix || 'alpha' }}
+
+      # ================================================================
+      # Custom Processing
+      # Add your own steps here. All commits will be included in the tag.
+      # ================================================================
+
+      # Example: Update CMakeLists.txt
+      - name: Update CMakeLists.txt
+        if: steps.prepare.outputs.needs-release == 'true'
+        run: |
+          VERSION="${{ steps.prepare.outputs.version-core }}"
+          MAJOR="${{ steps.prepare.outputs.major }}"
+          MINOR="${{ steps.prepare.outputs.minor }}"
+          PATCH="${{ steps.prepare.outputs.patch }}"
+
+          # Skip if CMakeLists.txt doesn't exist
+          [ -f CMakeLists.txt ] || exit 0
+
+          echo "Updating CMakeLists.txt to version ${VERSION}"
+
+          # Pattern: project(name VERSION x.y.z)
+          if grep -q "project.*VERSION" CMakeLists.txt; then
+            sed -i "s/\(project([^)]*VERSION\s\+\)[0-9.]\+/\1${VERSION}/" CMakeLists.txt
+          fi
+
+          # Pattern: set(PROJECT_VERSION "x.y.z")
+          if grep -q "set(PROJECT_VERSION" CMakeLists.txt; then
+            sed -i "s/set(PROJECT_VERSION \"[^\"]*\")/set(PROJECT_VERSION \"${VERSION}\")/" CMakeLists.txt
+          fi
+
+          # Pattern: Individual version variables
+          if grep -q "set(PROJECT_VERSION_MAJOR" CMakeLists.txt; then
+            sed -i "s/set(PROJECT_VERSION_MAJOR [0-9]*)/set(PROJECT_VERSION_MAJOR ${MAJOR})/" CMakeLists.txt
+            sed -i "s/set(PROJECT_VERSION_MINOR [0-9]*)/set(PROJECT_VERSION_MINOR ${MINOR})/" CMakeLists.txt
+            sed -i "s/set(PROJECT_VERSION_PATCH [0-9]*)/set(PROJECT_VERSION_PATCH ${PATCH})/" CMakeLists.txt
+          fi
+
+          git add CMakeLists.txt
+
+      # Example: Update Cargo.toml
+      - name: Update Cargo.toml
+        if: steps.prepare.outputs.needs-release == 'true'
+        run: |
+          VERSION="${{ steps.prepare.outputs.version-core }}"
+
+          # Skip if Cargo.toml doesn't exist
+          [ -f Cargo.toml ] || exit 0
+
+          echo "Updating Cargo.toml to version ${VERSION}"
+          sed -i "0,/^version = /s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+
+          # Update Cargo.lock if exists
+          if [ -f Cargo.lock ]; then
+            cargo update --workspace 2>/dev/null || true
+            git add Cargo.lock
+          fi
+
+          git add Cargo.toml
+
+      # Example: Update VERSION file
+      - name: Update VERSION file
+        if: steps.prepare.outputs.needs-release == 'true'
+        run: |
+          VERSION="${{ steps.prepare.outputs.version-core }}"
+          echo "${VERSION}" > VERSION
+          git add VERSION
+
+      # Commit all version file changes
+      - name: Commit version updates
+        if: steps.prepare.outputs.needs-release == 'true'
+        run: |
+          # Only commit if there are staged changes
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump version to ${{ steps.prepare.outputs.version-core }}"
+          fi
+
+      # ================================================================
+      # Phase 2: FINALIZE
+      # - Create tag (includes all commits from prepare + custom steps)
+      # - Push commits and tag
+      # - Create GitHub Release
+      # ================================================================
+      - name: Finalize Release
+        id: finalize
+        if: steps.prepare.outputs.needs-release == 'true'
+        uses: yoriito/actions/semantic-release@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          phase: finalize
+          finalize-version: ${{ steps.prepare.outputs.version }}
+          finalize-version-core: ${{ steps.prepare.outputs.version-core }}
+          finalize-tag-name: ${{ steps.prepare.outputs.tag-name }}
+          finalize-changelog: ${{ steps.prepare.outputs.changelog }}
+          finalize-is-prerelease: ${{ steps.prepare.outputs.is-prerelease }}
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.prepare.outputs.needs-release }}" = "true" ]; then
+            echo "## 🎉 Release Created" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Version | ${{ steps.prepare.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Tag | ${{ steps.prepare.outputs.tag-name }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Type | ${{ steps.prepare.outputs.bump-type }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Pre-release | ${{ steps.prepare.outputs.is-prerelease }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ℹ️ No Release Needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No conventional commits found since last release." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ================================================================
+  # Optional: Build job that runs after release
+  # ================================================================
+  build:
+    name: Build
+    needs: release
+    if: needs.release.outputs.release-created == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-latest
+            target: macos-x64
+          - os: windows-latest
+            target: windows-x64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release.outputs.tag-name }}
+
+      - name: Build
+        run: |
+          echo "Building version ${{ needs.release.outputs.version }} for ${{ matrix.target }}"
+          # Add your build steps here
+          # cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+          # cargo build --release
+
+      - name: Package
+        run: |
+          echo "Packaging for ${{ matrix.target }}"
+          # Add your packaging steps here
+          # tar -czvf myapp-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz ...
+
+      # - name: Upload to Release
+      #   run: |
+      #     gh release upload ${{ needs.release.outputs.tag-name }} \
+      #       myapp-${{ needs.release.outputs.version }}-${{ matrix.target }}.* \
+      #       --clobber
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
