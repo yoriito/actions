@@ -25,7 +25,7 @@ inputs:
   types:
     description: 'Allowed commit types (comma-separated)'
     required: false
-    default: 'feat,fix,docs,style,refactor,perf,test,chore,ci,build'
+    default: 'feat,fix,docs,style,refactor,perf,test,chore,ci,build,revert'
   require-scope:
     description: 'Require scope in commit message'
     required: false
@@ -94,7 +94,7 @@ runs:
           SHORT_SHA="${sha:0:7}"
 
           # Skip merge commits if configured
-          if [ "$IGNORE_MERGE" = "true" ] && echo "$message" | grep -qE "^Merge (pull request|branch)"; then
+          if [ "$IGNORE_MERGE" = "true" ] && echo "$message" | grep -qE "^Merge (pull request|branch|remote-tracking branch)"; then
             echo "⏭️  $SHORT_SHA: Merge commit (skipped)"
             continue
           fi
