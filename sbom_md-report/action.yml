@@ -1,0 +1,303 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 JASPAR
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Generate SPDX Markdown"
+description: "Generate markdown reports from SPDX JSON files"
+runs:
+  using: "composite"
+  steps:
+    - name: Generate Markdown files
+      shell: bash
+      run: |
+        python <<'PY'
+        import json
+        import pathlib
+        import re
+
+        generated = 0
+
+        ##### Category mapping for Licenses.  ####
+        # Set of licenses that are considered "Permissive".
+        LICENSE_CATEGORY_GREEN = {
+            "Apache-2.0",
+            "MS-PL",
+            "MIT",
+            "BSD-2-Clause",
+            "BSD-3-Clause",
+            "ISC",
+            "Zlib",
+        }
+
+        # Set of licenses that are considered "Review Required" which haven't been reviewed previous release.
+        LICENSE_CATEGORY_YELLOW = {
+            "CC0-1.0",
+            "BlueOak-1.0.0",
+            "WTFPL",
+            "PSF-2.0",
+            }
+
+        # Set of licenses that are considered "Restricted (Exception required)" because of COPYLEFT licenses.
+        LICENSE_CATEGORY_RED = {
+            "AGPL-3.0",
+            "EUPL-1.1",
+            "GPL-2.0",
+            "GPL-3.0",
+            "CDDL-1.0",
+            "CDDL-1.1",
+            "MPL-2.0",
+            "EPL-1.0",
+            "EPL-2.0",
+            "LGPL-2.1",
+            "LGPL-3.0",
+            }
+
+        LICENSE_UNKNOWN = {
+            "",
+            "NOASSERTION", 
+            "NONE",
+            }
+
+        def normalize(value):
+            if value is None:
+                return ""
+            if isinstance(value, list):
+                return ", ".join(str(v) for v in value)
+            return str(value)
+
+        def escape_md(value):
+            text = normalize(value)
+            text = text.replace("|", r"\|")
+            text = text.replace("\n", " ").replace("\r", " ")
+            return text.strip()
+
+        def extract_spdx_tokens(expr):
+            raw = normalize(expr).strip()
+            if not raw:
+                return []
+
+            # Replace parentheses with spaces, then split by whitespace.
+            s = raw.replace("(", " ").replace(")", " ")
+            parts = re.split(r"\s+", s)
+
+            tokens = []
+            operators = {"AND", "OR", "WITH"}
+            for p in parts:
+                t = p.strip()
+                if not t:
+                    continue
+                # Exclude SPDX operators (case-insensitive).
+                if t.upper() in operators:
+                    continue
+                # Treat '+' suffix (e.g. GPL-2.0+) as the base license ID (GPL-2.0).
+                if t.endswith("+"):
+                    t = t[:-1]
+                tokens.append(t)
+            return tokens
+
+        def categorize_license(license_declared, license_concluded):
+            # Prioritize concluded, then declared.
+            expressions = [normalize(license_concluded).strip(), normalize(license_declared).strip()]
+            if not any(expressions):
+                return "Unspecified/Unknown (Review Required)"
+
+            found_green = False
+            found_yellow = False
+            unknown_only = True
+            found_uncategorized = False
+
+            for expr in expressions:
+                if not expr:
+                    continue
+
+                tokens = extract_spdx_tokens(expr)
+                if not tokens:
+                    # Also handle single-token values like "NOASSERTION" and "NONE".
+                    if expr in LICENSE_UNKNOWN:
+                        continue
+                    tokens = [expr]
+
+                for lic in tokens:
+                    lic_norm = normalize(lic).strip()
+
+                    if not lic_norm:
+                        continue
+
+                    if lic_norm in LICENSE_UNKNOWN:
+                        continue
+
+                    unknown_only = False
+
+                    if lic_norm in LICENSE_CATEGORY_RED:
+                        return "Restricted (Exception required)"
+                    if lic_norm in LICENSE_CATEGORY_YELLOW:
+                        found_yellow = True
+                    elif lic_norm in LICENSE_CATEGORY_GREEN:
+                        found_green = True
+                    else:
+                        found_uncategorized = True
+
+            if unknown_only:
+                return "Unspecified/Unknown (Review Required)"
+            if found_uncategorized:
+                return "Uncategorized (Review Required)"                  
+            if found_yellow:
+                return "Review Required"
+            if found_green:
+                return "Permissive"
+            
+            return "Uncategorized (Review Required)"
+
+        def build_issue_line(name, version, license_declared, license_concluded, category):
+            disp_name = escape_md(name) or "Unknown"
+            disp_version = escape_md(version) or ""
+            concluded = normalize(license_concluded).strip()
+            declared = normalize(license_declared).strip()
+            target = concluded or declared or "UNKNOWN"
+
+            if category == "Unspecified/Unknown (Review Required)":
+                return f"- {disp_name} ({disp_version}): {target} - License not clearly specified"
+
+            if category == "Review Required":
+                return f"- {disp_name} ({disp_version}): {target} - Review Required"
+
+            if category == "Restricted (Exception required)":
+                return f"- {disp_name} ({disp_version}): {target} - Restricted (Exception required)"
+
+            if category == "Uncategorized (Review Required)":
+                return f"- {disp_name} ({disp_version}): {target} - Uncategorized (Review Required)"
+            return None
+
+        def review_status_for(category):
+            return "✅" if category == "Permissive" else "✅ / ❌"
+
+
+        ##############################################
+        ## Create Markdown files for each JSON report
+        ##############################################
+        for report_dir in pathlib.Path(".").glob("security-reports*"):
+            if not report_dir.is_dir():
+                continue
+
+            for json_file in report_dir.rglob("*.json"):
+                try:
+                    data = json.loads(json_file.read_text(encoding="utf-8"))
+
+                    doc_name = escape_md(data.get("name", "Unknown"))
+                    spdx_version = escape_md(data.get("spdxVersion", ""))
+                    created = escape_md(data.get("creationInfo", {}).get("created", ""))
+                    data_license = escape_md(data.get("dataLicense", ""))
+
+                    packages = data.get("packages", [])
+                    rows = []
+                    issues = []
+                    issue_seen = set()
+
+                    for pkg in packages:
+                        pkg_name = pkg.get("name", "")
+                        version = pkg.get("versionInfo", "")
+                        license_concluded = pkg.get("licenseConcluded", "")
+                        license_declared = pkg.get("licenseDeclared", "")
+                        category = categorize_license(license_declared, license_concluded)
+                        review_status = review_status_for(category)
+
+                        rows.append(
+                            "| {name} | {version} | {concluded} | {declared} | {category} | {review_status} |".format(
+                                name=escape_md(pkg_name),
+                                version=escape_md(version),
+                                concluded=escape_md(license_concluded),
+                                declared=escape_md(license_declared),
+                                category=escape_md(category),
+                                review_status=escape_md(review_status),
+                            )
+                        )
+
+                        issue_line = build_issue_line(
+                            pkg_name,
+                            version,
+                            license_declared,
+                            license_concluded,
+                            category,
+                        )
+                        if issue_line:
+                            if issue_line not in issue_seen:
+                                issues.append(issue_line)
+                                issue_seen.add(issue_line)
+
+                    md_lines = [
+                        "# SBOM License Analysis Report",
+                        "",
+                        "This report summarizes the OSS licenses in the SBOM files and highlights potential issues.",
+                        "",
+                        f"## {doc_name}",
+                        "",
+                        "| Item | Value |",
+                        "|------|------|",
+                        f"| SPDX Version | {spdx_version} |",
+                        f"| Created | {created} |",
+                        f"| Data License | {data_license} |",
+                        "",
+                        f"### Packages (Number of packages: {len(packages)})",
+                        "",
+                        "<details>",
+                        "<summary>Compliance categories are defined as follows</summary>",
+                        "",
+                        "- **Permissive**: Complies with organization policy. No review required.",
+                        "- **Review Required**: Non-copyleft. Not reviewed in a previous release, so review required.",
+                        "- **Uncategorized**: A license not covered by the automatic categorization. Review required.",
+                        "- **Unspecified/Unknown**: License is unknown. Review required.",
+                        "- **Restricted (Exception required)**: Copyleft. In principle prohibited, but may be used only for reference implementations as an exception. Review and exception required.",
+                        "",
+                        "</details>",
+                        "",
+                        "| Package Name | Version | License Concluded | License Declared | Compliance Category | Review Status |",
+                        "|-------------|---------|-------------------|------------------|-----------------|---------------|",
+                    ]
+
+                    if rows:
+                        md_lines.extend(rows)
+                    else:
+                        md_lines.append("| - | - | - | - | - | - |")
+
+                    md_lines.extend([
+                        "",
+                        "### Potential Issues:",
+                    ])
+
+                    if issues:
+                        md_lines.extend(issues)
+                    else:
+                        md_lines.append("- None")
+
+                    md_lines.append("")
+
+                    md = "\n".join(md_lines)
+
+                    md_file = json_file.with_suffix(".md")
+                    md_file.write_text(md, encoding="utf-8")
+
+                    print(f"Generated: {md_file}")
+                    generated += 1
+
+                except Exception as e:
+                    print(f"ERROR: {json_file}: {e}")
+
+        print(f"Generated {generated} markdown files")
+        PY
+
+    - name: Show generated files
+      shell: bash
+      run: |
+        find security-reports* -name "*.md" | sort
