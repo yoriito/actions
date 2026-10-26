@@ -10,6 +10,30 @@ Automated semantic versioning, CHANGELOG generation, and release creation based 
 - ✅ Pre-release support (alpha, beta, rc)
 - ✅ Rich outputs for post-processing (update CMakeLists.txt, Cargo.toml, etc.)
 
+## Architecture
+
+This action is implemented as a **composite action** with modular shell scripts:
+
+```
+semantic-release/
+├── action.yml                          # Action orchestration (210 lines)
+├── scripts/
+│   ├── setup.sh                        # Git configuration (15 lines)
+│   ├── analyze.sh                      # Commit analysis & version calculation (313 lines)
+│   ├── changelog-generate.sh           # CHANGELOG generation (90 lines)
+│   └── finalize.sh                     # Tag creation & GitHub release (85 lines)
+└── README.md
+```
+
+### Design Principles
+
+- **Modularity**: Each script has a single responsibility
+- **Testability**: Scripts can be unit tested independently
+- **Reusability**: Scripts can be invoked from other workflows
+- **Maintainability**: Clear separation of concerns
+
+---
+
 ## Version Bump Rules
 
 | Commit Type | Version Bump | Example |

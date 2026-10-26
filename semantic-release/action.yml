@@ -35,7 +35,7 @@ inputs:
     required: false
     default: 'CHANGELOG.md'
   initial-development:
-    description: 'Initial development mode (for 0.X.X only): breaking->major, minor->patch, patch->patch'
+    description: 'Initial development mode (for 0.X.X only): breaking->minor, minor->patch, patch->patch'
     required: false
     default: 'false'
   prerelease:
@@ -124,18 +124,27 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Setup Git
+    # ============================================================
+    # SETUP PHASE: Configure git user identity, fetch git histories and tags
+    # ============================================================
+    # Configure git user for bot commits.
+    - name: Configure Git bot user and email
       shell: bash
-      run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git fetch --unshallow || true
-        git fetch --tags --force --all
+      run: bash "${{ github.action_path }}/scripts/setup.sh"
+
+    # Fetch repository histories and tags needed for version detection.
+    - name: Fetch git histories and tags for version analysis
+      if: inputs.phase == 'all' || inputs.phase == 'prepare'
+      shell: bash
+      run: bash "${{ github.action_path }}/scripts/fetch.sh"
 
     # ============================================================
-    # PREPARE PHASE: Analyze commits, generate changelog, commit
+    # PREPARE PHASE: Analyze commits, generate changelog
     # ============================================================
-    - name: Analyze Commits and Determine Version
+    # Determine semantic version bump by analyzing conventional commits
+    # since the latest tag. Outputs version numbers and categories
+    # (features, fixes, breaking changes, others).
+    - name: Analyze commits to determine semantic version bump
       id: analyze
       if: inputs.phase == 'all' || inputs.phase == 'prepare'
       shell: bash
@@ -146,307 +155,12 @@ runs:
         INITIAL_DEVELOPMENT: ${{ inputs.initial-development }}
         PRERELEASE_MODE: ${{ inputs.prerelease }}
         PRERELEASE_SUFFIX: ${{ inputs.prerelease-suffix }}
-      run: |
-        # Get the latest semver tag (including prerelease tags)
-        LATEST_TAG=$(git tag --merged HEAD --sort=-version:refname \
-          | grep -E "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z][a-zA-Z0-9]*(\.[0-9]+)?)?$" \
-          | head -1 || echo "")
+      run: bash "${{ github.action_path }}/scripts/analyze.sh"
 
-        echo "Latest tag: $LATEST_TAG"
-
-        FIRST_RELEASE=false
-        
-        if [ -z "$LATEST_TAG" ]; then
-          echo "This is the first release"
-          CURRENT_MAJOR=0
-          CURRENT_MINOR=1
-          CURRENT_PATCH=0
-          CURRENT_PRERELEASE=""
-          CURRENT_PRERELEASE_NUM=0
-          COMMITS_SINCE=""
-          FIRST_RELEASE=true
-        else
-          # Parse version from tag
-          VERSION_STRING="${LATEST_TAG#$TAG_PREFIX}"
-          
-          # Separate prerelease part
-          # Supported formats: 1.2.3, 1.2.3-alpha, 1.2.3-alpha.1
-          if [[ "$VERSION_STRING" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-([a-zA-Z]+)(\.([0-9]+))?)?$ ]]; then
-            CURRENT_MAJOR="${BASH_REMATCH[1]}"
-            CURRENT_MINOR="${BASH_REMATCH[2]}"
-            CURRENT_PATCH="${BASH_REMATCH[3]}"
-            CURRENT_PRERELEASE="${BASH_REMATCH[5]:-}"
-            CURRENT_PRERELEASE_NUM="${BASH_REMATCH[7]:-0}"
-            
-            # Handle prerelease suffix without number (e.g., 1.2.3-alpha)
-            if [ -n "$CURRENT_PRERELEASE" ] && [ "$CURRENT_PRERELEASE_NUM" = "0" ] && [ -z "${BASH_REMATCH[7]}" ]; then
-              CURRENT_PRERELEASE_NUM=0
-            fi
-          else
-            echo "Warning: Could not parse version from tag: $VERSION_STRING"
-            CURRENT_MAJOR=0
-            CURRENT_MINOR=1
-            CURRENT_PATCH=0
-            CURRENT_PRERELEASE=""
-            CURRENT_PRERELEASE_NUM=0
-          fi
-          
-          COMMITS_SINCE="${LATEST_TAG}..HEAD"
-        fi
-
-        echo "Current version: ${CURRENT_MAJOR}.${CURRENT_MINOR}.${CURRENT_PATCH}"
-        [ -n "$CURRENT_PRERELEASE" ] && echo "Current prerelease: ${CURRENT_PRERELEASE}.${CURRENT_PRERELEASE_NUM}"
-
-        # Detect prerelease -> stable promotion (no commits required)
-        NEED_FORCE_RELEASE=false
-        if [ "$PRERELEASE_MODE" = "false" ] && [ -n "$CURRENT_PRERELEASE" ]; then
-          echo "Promoting prerelease ${LATEST_TAG} to stable ${CURRENT_MAJOR}.${CURRENT_MINOR}.${CURRENT_PATCH}"
-          NEED_FORCE_RELEASE=true
-        fi
-
-        # Analyze commit log
-        MAJOR_BUMP=false
-        MINOR_BUMP=false
-        PATCH_BUMP=false
-
-        FEATURES=""
-        FIXES=""
-        BREAKING=""
-        OTHERS=""
-
-        # Pre-fetch all commit bodies in one pass to avoid per-commit git calls
-        # Store commit bodies to a hash array with using a commit hash as a key
-        declare -A COMMIT_BODIES
-        _current_hash=""
-        while IFS= read -r _line; do
-          if [[ "$_line" =~ ^BODYHASH:([0-9a-f]+)$ ]]; then
-            _current_hash="${BASH_REMATCH[1]}"
-            COMMIT_BODIES["$_current_hash"]=""
-          elif [ -n "$_current_hash" ]; then
-            COMMIT_BODIES["$_current_hash"]+="${_line}"$'\n'
-          fi
-        done < <(git log $COMMITS_SINCE --no-merges --format="BODYHASH:%H%n%b" 2>/dev/null || true)
-
-        # Use \x01 (instead of |) as field separator to avoid collisions with commit message content
-        COMMIT_LOG=$(git log $COMMITS_SINCE --no-merges --pretty=format:"%s%x01%H" 2>/dev/null || echo "")
-
-        echo "=== Commits to analyze ==="
-        echo "$COMMIT_LOG"
-        echo "==========================="
-        
-        # Exit if no commits
-        if [ -z "$COMMIT_LOG" ]; then
-          if [ "$NEED_FORCE_RELEASE" = "true" ]; then
-            echo "No new commits, but promoting prerelease to stable"
-          else
-            echo "No commits found that require a release"
-            echo "needs-release=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-        fi
-
-        # Use `\x01` as a separator for corner case that | is used in a commit message
-        while IFS=$'\x01' read -r message hash; do
-          [ -z "$message" ] && continue
-          
-          # Detect BREAKING CHANGE (feat!:, fix!:, BREAKING CHANGE)
-          echo "Checking: [$message]"
-          if echo "$message" | grep -qE "^[a-z]+(\(.+\))?!:" || echo "$message" | grep -qE "^BREAKING CHANGE(\(.+\))?!?:"; then
-            echo "  -> BREAKING CHANGE detected"
-            MAJOR_BUMP=true
-            BREAKING="${BREAKING}- ${message} (${hash})\n"
-            continue
-          fi
-
-          # Detect BREAKING CHANGE in footer/body using pre-fetched commits
-          if printf '%s' "${COMMIT_BODIES[$hash]}" | grep -qE "^BREAKING CHANGE(:|$)"; then
-            echo "  -> BREAKING CHANGE detected in footer/body"
-            MAJOR_BUMP=true
-            BREAKING="${BREAKING}- ${message} (${hash})\n"
-            continue
-          fi
-
-          # Detect feat: -> minor
-          if echo "$message" | grep -qE "^feat(\(.+\))?:"; then
-            echo "  -> Minor change detected"
-            MINOR_BUMP=true
-            FEATURES="${FEATURES}- ${message} (${hash})\n"
-          # Detect fix: -> patch
-          elif echo "$message" | grep -qE "^fix(\(.+\))?:"; then
-            echo "  -> Patch change detected"
-            PATCH_BUMP=true
-            FIXES="${FIXES}- ${message} (${hash})\n"
-          # Other Conventional Commits -> patch
-          elif echo "$message" | grep -qE "^(docs|style|refactor|perf|test|chore|ci|build)(\(.+\))?:"; then
-            echo "  -> Patch change detected"
-            PATCH_BUMP=true
-            OTHERS="${OTHERS}- ${message} (${hash})\n"
-          fi
-        done <<< "$COMMIT_LOG"
-        
-        # Exit if no releasable commits found
-        if [ "$MAJOR_BUMP" = false ] && [ "$MINOR_BUMP" = false ] && [ "$PATCH_BUMP" = false ]; then
-          if [ "$NEED_FORCE_RELEASE" = "true" ]; then
-             echo "No new commits, but promoting prerelease to stable"
-          else
-            echo "No Conventional Commits found that require a release"
-            echo "needs-release=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-        fi
-        
-        # Calculate version
-        NEW_MAJOR=$CURRENT_MAJOR
-        NEW_MINOR=$CURRENT_MINOR
-        NEW_PATCH=$CURRENT_PATCH
-        NEW_PRERELEASE_NUM=0
-        
-        # Determine bump type
-        if [ "$MAJOR_BUMP" = true ]; then
-          BUMP_TYPE="major"
-        elif [ "$MINOR_BUMP" = true ]; then
-          BUMP_TYPE="minor"
-        else
-          BUMP_TYPE="patch"
-        fi
-
-        # initial development mode
-        if [ "$INITIAL_DEVELOPMENT" = "true" ] && [ "$CURRENT_MAJOR" = "0" ]; then
-          echo "Initial development mode enabled"
-          echo "=== Before initial-dev check ==="
-          echo "INITIAL_DEVELOPMENT=$INITIAL_DEVELOPMENT"
-          echo "CURRENT_MAJOR=$CURRENT_MAJOR"
-          echo "BUMP_TYPE=$BUMP_TYPE"
-          echo "MAJOR_BUMP=$MAJOR_BUMP, MINOR_BUMP=$MINOR_BUMP, PATCH_BUMP=$PATCH_BUMP"
-          echo "================================="
-          case "$BUMP_TYPE" in
-            major)
-              echo "Shifting major to minor"
-              BUMP_TYPE="minor"
-              MAJOR_BUMP=false
-              MINOR_BUMP=true
-              ;;
-            minor | patch)
-              echo "Shifting minor/patch to patch"
-              BUMP_TYPE="patch"
-              MAJOR_BUMP=false
-              MINOR_BUMP=false
-              ;;
-          esac
-          echo "=== After initial-dev check ==="
-          echo "BUMP_TYPE=$BUMP_TYPE"
-          echo "MAJOR_BUMP=$MAJOR_BUMP, MINOR_BUMP=$MINOR_BUMP, PATCH_BUMP=$PATCH_BUMP"
-          echo "================================="
-        else
-          echo "Initial development mode not enabled or not applicable"
-        fi
-        
-        # Pre-release mode
-        if [ "$PRERELEASE_MODE" = "true" ]; then
-          # If current tag has the same prerelease suffix, increment the number
-          if [ "$CURRENT_PRERELEASE" = "$PRERELEASE_SUFFIX" ]; then
-            NEW_PRERELEASE_NUM=$((CURRENT_PRERELEASE_NUM + 1))
-          else
-            # Start new prerelease series - calculate core version first
-            if [ "$MAJOR_BUMP" = true ]; then
-              NEW_MAJOR=$((CURRENT_MAJOR + 1))
-              NEW_MINOR=0
-              NEW_PATCH=0
-            elif [ "$MINOR_BUMP" = true ]; then
-              NEW_MINOR=$((CURRENT_MINOR + 1))
-              NEW_PATCH=0
-            else
-              NEW_PATCH=$((CURRENT_PATCH + 1))
-            fi
-            NEW_PRERELEASE_NUM=1
-          fi
-          
-          NEW_VERSION="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}-${PRERELEASE_SUFFIX}.${NEW_PRERELEASE_NUM}"
-          VERSION_CORE="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
-          IS_PRERELEASE="true"
-          BUMP_TYPE="prerelease"
-        else
-          # Normal release mode
-          # If current is prerelease, release that core version if the core version does not exist
-          CURRENT_STABLE_VERSION="${TAG_PREFIX}${CURRENT_MAJOR}.${CURRENT_MINOR}.${CURRENT_PATCH}"
-          if [ -n "$CURRENT_PRERELEASE" ] && ! git rev-parse "$CURRENT_STABLE_VERSION" > /dev/null 2>&1; then
-            # Release from prerelease - keep the same version
-            echo "promoting prerelease ${CURRENT_STABLE_VERSION} to stable"
-            NEW_VERSION="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
-          else
-            # Normal version bump
-            if [ "$MAJOR_BUMP" = true ]; then
-              NEW_MAJOR=$((CURRENT_MAJOR + 1))
-              NEW_MINOR=0
-              NEW_PATCH=0
-            elif [ "$MINOR_BUMP" = true ]; then
-              NEW_MINOR=$((CURRENT_MINOR + 1))
-              NEW_PATCH=0
-            else
-              NEW_PATCH=$((CURRENT_PATCH + 1))
-            fi
-            NEW_VERSION="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
-          fi
-          VERSION_CORE="$NEW_VERSION"
-          IS_PRERELEASE="false"
-          NEW_PRERELEASE_NUM=0
-        fi
-
-        # if first release, version is overrided to 0.1.0
-        if [ "$FIRST_RELEASE" = true ]; then
-          echo "First release detected, overriding version to 0.1.0"
-          NEED_RELEASE=true
-          NEW_VERSION="0.1.0"
-          VERSION_CORE="0.1.0"
-          NEW_MAJOR=0
-          NEW_MINOR=1
-          NEW_PATCH=0
-          IS_PRERELEASE="false"
-          BUMP_TYPE="patch"
-          NEW_PRERELEASE_NUM=0
-        fi
-        
-        TAG_NAME="${TAG_PREFIX}${NEW_VERSION}"
-        
-        echo "New version: $NEW_VERSION (bump type: $BUMP_TYPE)"
-        
-        echo "needs-release=true" >> $GITHUB_OUTPUT
-        echo "new-version=$NEW_VERSION" >> $GITHUB_OUTPUT
-        echo "version-core=$VERSION_CORE" >> $GITHUB_OUTPUT
-        echo "major=$NEW_MAJOR" >> $GITHUB_OUTPUT
-        echo "minor=$NEW_MINOR" >> $GITHUB_OUTPUT
-        echo "patch=$NEW_PATCH" >> $GITHUB_OUTPUT
-        echo "prerelease-number=$NEW_PRERELEASE_NUM" >> $GITHUB_OUTPUT
-        echo "is-prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
-        echo "bump-type=$BUMP_TYPE" >> $GITHUB_OUTPUT
-        echo "tag-name=$TAG_NAME" >> $GITHUB_OUTPUT
-        
-        # Save content for CHANGELOG
-        {
-          echo "features<<EOF"
-          echo -e "$FEATURES"
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
-        
-        {
-          echo "fixes<<EOF"
-          echo -e "$FIXES"
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
-        
-        {
-          echo "breaking<<EOF"
-          echo -e "$BREAKING"
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
-        
-        {
-          echo "others<<EOF"
-          echo -e "$OTHERS"
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
-
-    - name: Generate CHANGELOG
+    # Create CHANGELOG.md entry for the new release based on analyzed commits
+    # Groups changes by type (features, fixes, breaking changes) and includes
+    # commit links and author information.
+    - name: Generate CHANGELOG from conventional commits
       if: (inputs.phase == 'all' || inputs.phase == 'prepare') && steps.analyze.outputs.needs-release == 'true'
       id: changelog
       shell: bash
@@ -459,161 +173,56 @@ runs:
         CHANGELOG_PATH: ${{ inputs.changelog-path }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
         IS_PRERELEASE: ${{ steps.analyze.outputs.is-prerelease }}
-      run: |
-        DATE=$(date +%Y-%m-%d)
-        
-        # Add label for pre-release
-        if [ "$IS_PRERELEASE" = "true" ]; then
-          VERSION_LABEL="${NEW_VERSION} (Pre-release)"
-        else
-          VERSION_LABEL="${NEW_VERSION}"
-        fi
-        
-        # Generate new CHANGELOG entry
-        CHANGELOG_ENTRY="## [${VERSION_LABEL}](../../releases/tag/${TAG_PREFIX}${NEW_VERSION}) - ${DATE}\n\n"
-        
-        if [ -n "$BREAKING" ]; then
-          CHANGELOG_ENTRY="${CHANGELOG_ENTRY}### ⚠ BREAKING CHANGES\n\n${BREAKING}\n"
-        fi
-        
-        if [ -n "$FEATURES" ]; then
-          CHANGELOG_ENTRY="${CHANGELOG_ENTRY}### ✨ Features\n\n${FEATURES}\n"
-        fi
-        
-        if [ -n "$FIXES" ]; then
-          CHANGELOG_ENTRY="${CHANGELOG_ENTRY}### 🐛 Bug Fixes\n\n${FIXES}\n"
-        fi
-        
-        if [ -n "$OTHERS" ]; then
-          CHANGELOG_ENTRY="${CHANGELOG_ENTRY}### 🔧 Other Changes\n\n${OTHERS}\n"
-        fi
-        
-        # Update CHANGELOG file
-        if [ -f "$CHANGELOG_PATH" ]; then
-          # Prepend to existing CHANGELOG
-          TEMP_FILE=$(mktemp)
-          echo -e "# Changelog\n\nAll notable changes to this project will be documented in this file.\n\n${CHANGELOG_ENTRY}" > "$TEMP_FILE"
-          # Skip header lines and append existing content
-          tail -n +4 "$CHANGELOG_PATH" >> "$TEMP_FILE" 2>/dev/null || true
-          mv "$TEMP_FILE" "$CHANGELOG_PATH"
-        else
-          # Create new file
-          echo -e "# Changelog\n\nAll notable changes to this project will be documented in this file.\n\n${CHANGELOG_ENTRY}" > "$CHANGELOG_PATH"
-        fi
-        
-        # Save for release notes
-        {
-          echo "content<<EOF"
-          echo -e "$CHANGELOG_ENTRY"
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
-        
-        echo "CHANGELOG generated at $CHANGELOG_PATH"
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: bash "${{ github.action_path }}/scripts/changelog-generate.sh"
 
-    - name: Commit CHANGELOG (prepare phase)
-      if: (inputs.phase == 'all' || inputs.phase == 'prepare') && steps.analyze.outputs.needs-release == 'true'
+    # ============================================================
+    # FINALIZE PHASE: Commit and push changes, create tag, create GitHub release
+    # ============================================================
+    # Commit and push the generated CHANGELOG to origin with a conventional
+    # commit message. Skips commit if no changes were made.
+    - name: Commit and push updated CHANGELOG to origin
+      if: (inputs.phase == 'all' || inputs.phase == 'finalize') && steps.analyze.outputs.needs-release == 'true'
+      id: commit_push
       shell: bash
       env:
+        PHASE: ${{ inputs.phase }}
         NEW_VERSION: ${{ steps.analyze.outputs.new-version }}
+        TAG_NAME: ${{ steps.analyze.outputs.tag-name || inputs.finalize-tag-name }}
         IS_PRERELEASE: ${{ steps.analyze.outputs.is-prerelease }}
         CHANGELOG_PATH: ${{ inputs.changelog-path }}
-      run: |
-        git add "$CHANGELOG_PATH"
-        
-        if git diff --cached --quiet; then
-          echo "No CHANGELOG changes to commit"
-        else
-          if [ "$IS_PRERELEASE" = "true" ]; then
-            git commit -m "chore: release ${NEW_VERSION} (pre-release)"
-          else
-            git commit -m "chore: release ${NEW_VERSION}"
-          fi
-          echo "CHANGELOG committed"
-        fi
+        NEEDS_RELEASE: ${{ steps.analyze.outputs.needs-release }}
+      run: bash "${{ github.action_path }}/scripts/commit_push.sh"
 
-    # ============================================================
-    # FINALIZE PHASE: Tag, push, create GitHub release
-    # ============================================================
-    - name: Create Tag, Push, and Release
-      id: finalize
-      if: inputs.phase == 'all' || inputs.phase == 'finalize'
+    # Create and push git tag to origin for the new release version.
+    - name: Create and push release tag
+      if: (inputs.phase == 'all' || inputs.phase == 'finalize') && steps.analyze.outputs.needs-release == 'true'
+      id: tag
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+        IS_PRERELEASE: ${{ steps.analyze.outputs.is-prerelease }}
+        NEEDS_RELEASE: ${{ steps.analyze.outputs.needs-release }}
+        RELEASE_CREATED: ${{ steps.finalize.outputs.release-created }}
+        TAG_NAME: ${{ steps.analyze.outputs.tag-name || inputs.finalize-tag-name }}
+        NEW_VERSION: ${{ steps.analyze.outputs.new-version }}
+      run: bash "${{ github.action_path }}/scripts/tag.sh"
+
+    # Create a GitHub release with CHANGELOG content and metadata
+    # (version, release notes, prerelease status).
+    - name: Create GitHub release
+      if: (inputs.phase == 'all' || inputs.phase == 'finalize') && steps.analyze.outputs.needs-release == 'true'
+      id: release
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
         PHASE: ${{ inputs.phase }}
-        # From prepare phase (phase=all) or inputs (phase=finalize)
-        NEW_VERSION: ${{ steps.analyze.outputs.new-version || inputs.finalize-version }}
-        VERSION_CORE: ${{ steps.analyze.outputs.version-core || inputs.finalize-version-core }}
-        TAG_NAME: ${{ steps.analyze.outputs.tag-name || inputs.finalize-tag-name }}
         IS_PRERELEASE: ${{ steps.analyze.outputs.is-prerelease || inputs.finalize-is-prerelease }}
-        CHANGELOG_CONTENT: ${{ steps.changelog.outputs.content || inputs.finalize-changelog }}
-        NEEDS_RELEASE: ${{ steps.analyze.outputs.needs-release }}
         DRAFT: ${{ inputs.draft }}
-        TAG_PREFIX: ${{ inputs.tag-prefix }}
-      run: |
-        # Skip if prepare phase determined no release needed (phase=all only)
-        if [ "$PHASE" = "all" ] && [ "$NEEDS_RELEASE" != "true" ]; then
-          echo "No release needed, skipping finalize"
-          echo "release-created=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-        
-        # Validate required inputs for finalize phase
-        if [ -z "$NEW_VERSION" ] || [ -z "$TAG_NAME" ]; then
-          echo "Error: Missing required inputs for finalize phase"
-          echo "NEW_VERSION=$NEW_VERSION"
-          echo "TAG_NAME=$TAG_NAME"
-          exit 1
-        fi
-        
-        echo "Finalizing release: $TAG_NAME"
-
-        # If tag already exits, skip release
-        if git rev-parse "$TAG_NAME" > /dev/null 2>&1; then
-          echo "Warning: Tag $TAG_NAME already exists, skipping"
-          echo "release-created=false" >> ${GITHUB_OUTPUT}
-          exit 0
-        fi
-        
-        # Create tag (before push, so it's included)
-        git tag -a "$TAG_NAME" -m "Release ${NEW_VERSION}"
-        echo "Tag created: $TAG_NAME"
-        
-        # Push commits and tag together
-        git push origin HEAD --follow-tags
-        git push --tags || true
-        echo "Pushed commits and tag"
-        
-        # Create GitHub Release
-        PRERELEASE_FLAG=""
-        [ "$IS_PRERELEASE" = "true" ] && PRERELEASE_FLAG="--prerelease"
-        
-        DRAFT_FLAG=""
-        [ "$DRAFT" = "true" ] && DRAFT_FLAG="--draft"
-        
-        if [ "$IS_PRERELEASE" = "true" ]; then
-          RELEASE_TITLE="Pre-release ${NEW_VERSION}"
-        else
-          RELEASE_TITLE="Release ${NEW_VERSION}"
-        fi
-        
-        # Create release notes file
-        NOTES_FILE=$(mktemp)
-        echo -e "$CHANGELOG_CONTENT" > "$NOTES_FILE"
-        
-        RELEASE_URL=$(gh release create "$TAG_NAME" \
-          --title "$RELEASE_TITLE" \
-          --notes-file "$NOTES_FILE" \
-          $PRERELEASE_FLAG \
-          $DRAFT_FLAG 2>&1) || RELEASE_URL=""
-        
-        rm -f "$NOTES_FILE"
-        
-        echo "release-created=true" >> $GITHUB_OUTPUT
-        
-        if [ -n "$RELEASE_URL" ]; then
-          echo "release-url=$RELEASE_URL" >> $GITHUB_OUTPUT
-          echo "GitHub Release created: $RELEASE_URL"
-        fi
-        
-        echo "Release finalized: $TAG_NAME"
+        NEEDS_RELEASE: ${{ steps.analyze.outputs.needs-release }}
+        RELEASE_CREATED: ${{ steps.finalize.outputs.release-created }}
+        NEW_VERSION: ${{ steps.analyze.outputs.new-version || inputs.finalize-version }}
+        CHANGELOG_CONTENT: ${{ steps.changelog.outputs.content || inputs.finalize-changelog }}
+        TAG_NAME: ${{ steps.analyze.outputs.tag-name || inputs.finalize-tag-name }}
+      run: bash "${{ github.action_path }}/scripts/release.sh"
